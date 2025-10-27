@@ -1,18 +1,49 @@
 # bda_diabetes_app.py
+
 import os
+import sys
+import streamlit as st
 import pandas as pd
 import numpy as np
-import streamlit as st
 import matplotlib.pyplot as plt
 import seaborn as sns
+import json
+from kafka import KafkaProducer
+from kafka import KafkaConsumer
+import time
 
+# Force PySpark to use same Python as driver
+os.environ["PYSPARK_PYTHON"] = sys.executable
+os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
+
+# ----------------------------
+# Streamlit page config must be first Streamlit command
+# ----------------------------
+st.set_page_config(page_title="BDA Diabetes Prediction", layout="centered")
+st.title("🧠 Big Data Analytics — Diabetes Disease Prediction")
+st.write("This project demonstrates **distributed data analytics and ML using PySpark** with an interactive **Streamlit UI**.")
+
+# ----------------------------
+# Fix JAVA_HOME and PySpark Python versions
+# ----------------------------
+os.environ["JAVA_HOME"] = "/usr/lib/jvm/java-17-openjdk"
+os.environ["PATH"] = os.environ["JAVA_HOME"] + "/bin:" + os.environ["PATH"]
+
+# Debug info
+print("Python executable:", sys.executable)
+print("JAVA_HOME =", os.environ["JAVA_HOME"])
+os.system("java -version")
+
+# -------------------------------
+# PySpark imports
+# -------------------------------
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, when
 from pyspark.ml.feature import VectorAssembler, StandardScaler
 from pyspark.ml.classification import LogisticRegression, RandomForestClassifier
 from pyspark.ml.evaluation import BinaryClassificationEvaluator
 from pyspark.ml import Pipeline
-from pyspark.ml.linalg import DenseVector
+from pyspark.ml.pipeline import PipelineModel
 
 # -------------------------------
 # Initialize Spark Session
@@ -52,7 +83,6 @@ def pandas_to_spark(spark, df_pandas):
 # Data Preprocessing (PySpark)
 # -------------------------------
 def preprocess_data(sdf):
-    # Replace zeros with mean for certain columns
     cols_to_fix = ["Glucose", "BloodPressure", "SkinThickness", "Insulin", "BMI"]
     for c in cols_to_fix:
         mean_val = sdf.selectExpr(f"avg({c}) as mean_{c}").collect()[0][0]
@@ -107,33 +137,39 @@ def plot_auc_comparison(lr_auc, rf_auc):
     return fig
 
 # -------------------------------
-# Predict from user input
+# Predict Single Input
 # -------------------------------
 def predict_single(best_model, input_dict):
-    df = pd.DataFrame([input_dict])
-    sdf = pandas_to_spark(spark, df)
-    assembler = VectorAssembler(inputCols=list(df.columns), outputCol="features")
+    df_pandas = pd.DataFrame([input_dict])
+    sdf = pandas_to_spark(spark, df_pandas)
+    feature_cols = list(input_dict.keys())
+    assembler = VectorAssembler(inputCols=feature_cols, outputCol="features")
     scaler = StandardScaler(inputCol="features", outputCol="scaledFeatures")
-    assembled = assembler.transform(sdf)
-    scaled = scaler.fit(assembled).transform(assembled)
-    preds = best_model.transform(scaled).select("prediction", "probability").collect()[0]
-    return int(preds["prediction"]), float(preds["probability"][1])
+    sdf = assembler.transform(sdf)
+    sdf = scaler.fit(sdf).transform(sdf)
+    pred_row = best_model.transform(sdf).select("prediction", "probability").collect()[0]
+    return int(pred_row["prediction"]), float(pred_row["probability"][1])
+
+# -------------------------------
+# Kafka Producer for real-time data
+# -------------------------------
+producer = KafkaProducer(
+    bootstrap_servers='localhost:9092',
+    value_serializer=lambda v: json.dumps(v).encode('utf-8')
+)
 
 # -------------------------------
 # Streamlit UI
 # -------------------------------
-st.set_page_config(page_title="BDA Diabetes Prediction", layout="centered")
-st.title("🧠 Big Data Analytics — Diabetes Disease Prediction")
-st.write("This project demonstrates **distributed data analytics and ML using PySpark** with an interactive **Streamlit UI**.")
-
-# Sidebar options
 st.sidebar.header("Navigation")
 section = st.sidebar.radio("Choose a section:", ["📊 EDA", "⚙️ Train Models", "🩺 Predict"])
 
 uploaded_file = st.sidebar.file_uploader("Upload diabetes dataset (CSV)", type=["csv"])
 df = load_data(uploaded_file)
 
+# -------------------------------
 # EDA Section
+# -------------------------------
 if section == "📊 EDA":
     st.subheader("Exploratory Data Analysis (Pandas level)")
     st.write("First five rows of dataset:")
@@ -151,7 +187,9 @@ if section == "📊 EDA":
     sns.heatmap(corr, annot=True, cmap="Blues", ax=ax2)
     st.pyplot(fig2)
 
+# -------------------------------
 # Train Models Section
+# -------------------------------
 elif section == "⚙️ Train Models":
     st.subheader("Train Models using PySpark MLlib")
     sdf = pandas_to_spark(spark, df)
@@ -170,53 +208,104 @@ elif section == "⚙️ Train Models":
     best_model_path = "best_model_pyspark"
     results["best_model"].write().overwrite().save(best_model_path)
     st.write(f"💾 Best model saved to: `{best_model_path}`")
-
     st.session_state["best_model"] = results["best_model"]
 
+# -------------------------------
 # Predict Section
+# -------------------------------
 elif section == "🩺 Predict":
-    st.subheader("Diabetes Prediction on New Input")
+    st.subheader("Real-time Diabetes Prediction Dashboard")
+    st.write("Patient data will be consumed from Kafka in real-time.")
 
-    st.write("Enter patient details below:")
+    # Load trained model
+    if os.path.exists("best_model_pyspark"):
+        best_model = PipelineModel.load("best_model_pyspark")
+    elif "best_model" in st.session_state:
+        best_model = st.session_state["best_model"]
+    else:
+        st.error("Train the model first in the '⚙️ Train Models' section.")
+        st.stop()
 
-    pregnancies = st.number_input("Pregnancies", 0, 20, 2)
-    glucose = st.number_input("Glucose (mg/dL)", 0, 300, 120)
-    bp = st.number_input("Blood Pressure (mmHg)", 0, 200, 70)
-    skin = st.number_input("Skin Thickness (mm)", 0, 100, 20)
-    insulin = st.number_input("Insulin (mu U/ml)", 0, 1000, 79)
-    bmi = st.number_input("BMI", 0.0, 100.0, 25.0, step=0.1)
-    dpf = st.number_input("Diabetes Pedigree Function", 0.0, 5.0, 0.5, step=0.01)
-    age = st.number_input("Age", 1, 120, 33)
+    # Kafka Consumer
+    consumer = KafkaConsumer(
+        'diabetes_real_time',
+        bootstrap_servers='localhost:9092',
+        auto_offset_reset='latest',
+        value_deserializer=lambda x: json.loads(x.decode('utf-8'))
+    )
 
-    if st.button("Predict"):
-        # Try loading saved model
-        if os.path.exists("best_model_pyspark"):
-            from pyspark.ml.pipeline import PipelineModel
-            best_model = PipelineModel.load("best_model_pyspark")
-        elif "best_model" in st.session_state:
-            best_model = st.session_state["best_model"]
+    # -------------------------------
+    # Streamlit placeholders
+    # -------------------------------
+    placeholder_input = st.empty()
+    placeholder_pred = st.empty()
+    chart_placeholder = st.empty()
+    prob_placeholder = st.empty()
+    stats_placeholder = st.empty()
+
+    # Data storage for visualization
+    records = []
+
+    # Real-time loop
+    for message in consumer:
+        input_dict = message.value
+
+        # -------------------------------
+        # Predict using the trained model
+        # -------------------------------
+        df_pandas = pd.DataFrame([input_dict])
+        sdf = pandas_to_spark(spark, df_pandas)
+        pred_row = best_model.transform(sdf).select("prediction", "probability").collect()[0]
+        prediction = int(pred_row["prediction"])
+        probability = float(pred_row["probability"][1])
+
+        # Append record
+        records.append({
+            **input_dict,
+            "prediction": prediction,
+            "probability": probability
+        })
+
+        df_vis = pd.DataFrame(records)
+
+        # -------------------------------
+        # Display incoming data
+        # -------------------------------
+        placeholder_input.write("**Incoming Patient Data:**")
+        placeholder_input.json(input_dict)
+
+        if prediction == 1:
+            placeholder_pred.error(f"🔴 Diabetes predicted (Probability: {probability:.2f})")
         else:
-            st.error("Train the model first in the '⚙️ Train Models' section.")
-            st.stop()
+            placeholder_pred.success(f"🟢 No Diabetes predicted (Probability: {probability:.2f})")
 
-        input_dict = {
-            "Pregnancies": pregnancies,
-            "Glucose": glucose,
-            "BloodPressure": bp,
-            "SkinThickness": skin,
-            "Insulin": insulin,
-            "BMI": bmi,
-            "DiabetesPedigreeFunction": dpf,
-            "Age": age
-        }
+        # -------------------------------
+        # Update charts
+        # -------------------------------
+        fig, ax = plt.subplots(figsize=(6,4))
+        sns.countplot(x="prediction", data=df_vis, palette=["lightgreen", "salmon"], ax=ax)
+        ax.set_xticklabels(["No Diabetes", "Diabetes"])
+        ax.set_title("Prediction Counts (Real-time)")
+        chart_placeholder.pyplot(fig)
 
-        with st.spinner("Predicting using trained PySpark model..."):
-            pred, prob = predict_single(best_model, input_dict)
+        # Probability histogram
+        fig2, ax2 = plt.subplots(figsize=(6,3))
+        sns.histplot(df_vis["probability"], bins=20, color="skyblue", kde=True, ax=ax2)
+        ax2.set_title("Prediction Probability Distribution")
+        prob_placeholder.pyplot(fig2)
 
-        if pred == 1:
-            st.error(f"🔴 The model predicts **Diabetes (Probability: {prob:.2f})**")
-        else:
-            st.success(f"🟢 The model predicts **No Diabetes (Probability: {prob:.2f})**")
+        # Stats
+        total = len(df_vis)
+        diabetes_count = df_vis["prediction"].sum()
+        no_diabetes_count = total - diabetes_count
+        stats_placeholder.markdown(
+            f"**Total Patients:** {total}  |  "
+            f"**Predicted Diabetes:** {diabetes_count}  |  "
+            f"**Predicted No Diabetes:** {no_diabetes_count}"
+        )
+
+        # Slow down loop a little to not overwhelm Streamlit
+        time.sleep(0.1)
 
 st.sidebar.markdown("---")
 st.sidebar.info("Developed as a **Big Data Analytics Mini Project** using PySpark + Streamlit.")
